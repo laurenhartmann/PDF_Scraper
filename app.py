@@ -21,8 +21,10 @@ if uploaded_files:
         with st.expander(f"Metadata for: {file.name}"):
             session_date = st.date_input(f"Session Date for {file.name}", key=f"date_{i}")
             grade_level = st.selectbox(
-                f"Grade Level for {file.name}", list(range(0, 13)), key=f"grade_{i}"
-            )
+    f"Grade Level for {file.name}",
+    ["K"] + [str(i) for i in range(1, 13)],
+    key=f"grade_{i}"
+)
             group_number = st.selectbox(f"Group # for {file.name}", [1, 2], key=f"group_{i}")
             metadata.append({
                 "file": file,
