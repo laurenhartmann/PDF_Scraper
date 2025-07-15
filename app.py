@@ -93,3 +93,27 @@ if uploaded_files:
                                 "Last Name": last_name,
                                 "School": current_school,
                                 "Attended": attendance,
+                                "Session Date": entry["session_date"],
+                                "Grade Level": entry["grade_level"],
+                                "Group #": entry["group_number"],
+                                "Workshop Title": title,
+                                "File": file.name
+                            })
+                        except IndexError:
+                            st.warning(f"Could not parse name data for line: {line}")
+
+            except Exception as e:
+                st.warning(f"Could not process {file.name}: {e}")
+
+        if all_data:
+            final_df = pd.DataFrame(all_data)
+            st.success(f"Extracted {len(final_df)} rows across {len(metadata)} files.")
+            st.dataframe(final_df)
+
+            csv = final_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download Combined CSV",
+                data=csv,
+                file_name="combined_attendance.csv",
+                mime="text/csv"
+            )
