@@ -56,26 +56,40 @@ if uploaded_files:
                 for line in lines:
                     email_match = re.search(r"[\w\.-]+@[\w\.-]+", line)
                     sign_in_match = re.search(r"\bJul\s+\d{1,2}\s+2025.*(?:AM|PM)", line)
-
-                    last_names = re.findall(r"\b[A-Z]{2,}(?:\s[A-Z]{2,})*\b", line)
-                    first_names = re.findall(r"\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b", line)
-
-                    if email_match and last_names and first_names:
+                
+                    if email_match:
                         email = email_match.group(0)
-                        last_name = title_case(" ".join(last_names))
-                        first_name = title_case(first_names[0])
-                        attendance = True if sign_in_match else False
+                        parts = line.split()
+                        
+                        # Find index of email in line
+                        email_index = parts.index(email)
+                        
+                        try:
+                            # Skip status (assume it's directly after email)
+                            first_name = parts[email_index + 3]
+                            last_name_parts = parts[email_index + 2:email_index + 3]
+                            last_name = " ".join(last_name_parts)
+                
+                            full_name = f"{first_name} {last_name}"
+                            full_name = " ".join([n.capitalize() for n in full_name.split()])
+                            first_name = full_name.split()[0]
+                            last_name = " ".join(full_name.split()[1:])
+                
+                            attendance = True if sign_in_match else False
+                
+                            all_data.append({
+                                "Email": email,
+                                "First Name": first_name,
+                                "Last Name": last_name,
+                                "Attended": attendance,
+                                "Session Date": entry["session_date"],
+                                "Grade Level": entry["grade_level"],
+                                "Group #": entry["group_number"],
+                                "File": file.name
+                            })
+                        except IndexError:
+                            st.warning(f"Could not parse name data for line: {line}")
 
-                        all_data.append({
-                            "Email": email,
-                            "First Name": first_name,
-                            "Last Name": last_name,
-                            "Attended": attendance,
-                            "Session Date": entry["session_date"],
-                            "Grade Level": entry["grade_level"],
-                            "Group #": entry["group_number"],
-                            "File": file.name
-                        })
 
             except Exception as e:
                 st.warning(f"Could not process {file.name}: {e}")
