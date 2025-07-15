@@ -45,12 +45,48 @@ if uploaded_files:
 
             try:
                 with pdfplumber.open(pdf_path) as pdf:
-                    text = "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
+                    text = "\n".join(
+                        page.extract_text() for page in pdf.pages if page.extract_text()
+                    )
 
                 lines = text.splitlines()
 
                 for line in lines:
                     email_match = re.search(r"[\w\.-]+@[\w\.-]+", line)
-                    sign_in_match = re.search(r"\bJul\s+\d{1,2}\s+2025.*AM|PM", line)
+                    sign_in_match = re.search(r"\bJul\s+\d{1,2}\s+2025.*(?:AM|PM)", line)
 
-                    # Try to extract uppercase last name(s)
+                    last_names = re.findall(r"\b[A-Z]{2,}(?:\s[A-Z]{2,})*\b", line)
+                    first_names = re.findall(r"\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b", line)
+
+                    if email_match and last_names and first_names:
+                        email = email_match.group(0)
+                        last_name = title_case(" ".join(last_names))
+                        first_name = title_case(first_names[0])
+                        attendance = True if sign_in_match else False
+
+                        all_data.append({
+                            "Email": email,
+                            "First Name": first_name,
+                            "Last Name": last_name,
+                            "Attended": attendance,
+                            "Session Date": entry["session_date"],
+                            "Grade Level": entry["grade_level"],
+                            "Group #": entry["group_number"],
+                            "File": file.name
+                        })
+
+            except Exception as e:
+                st.warning(f"Could not process {file.name}: {e}")
+
+        if all_data:
+            final_df = pd.DataFrame(all_data)
+            st.success(f"Extracted {len(final_df)} rows across {len(metadata)} files.")
+            st.dataframe(final_df)
+
+            csv = final_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download Combined CSV",
+                data=csv,
+                file_name="combined_attendance.csv",
+                mime="text/csv"
+            )
