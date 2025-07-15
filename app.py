@@ -4,7 +4,7 @@ import pdfplumber
 import tempfile
 import re
 
-st.title("Batch PDF Attendance Extractor (No Java Required)")
+st.title("Batch PDF Attendance Extractor")
 
 uploaded_files = st.file_uploader(
     "Upload one or more attendance PDFs",
