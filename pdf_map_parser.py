@@ -267,7 +267,20 @@ def join_words(words: List[Dict]) -> str:
     words = sorted(words, key=lambda w: (w["top"], w["x0"]))
     return " ".join(word_text(w) for w in words).strip()
 
+def is_overall_classroom_row(class_text: str, school: str) -> bool:
+    """
+    Keep only overall classroom rows like:
+      (11X083.701.00)
 
+    Ignore subject-specific rows like:
+      ELA 7 (11X083.EENM7.72)
+      MATH 7 (11X083.MMNM7.72)
+    """
+    school_3 = str(school).zfill(3)
+
+    pattern = rf"^\s*\(11X{school_3}\.\d+\.00\)"
+    return re.search(pattern, class_text) is not None
+    
 # -----------------------------
 # Main extraction
 # -----------------------------
@@ -312,6 +325,10 @@ def extract_rows_from_pdf(pdf_bytes: bytes, filename: str) -> pd.DataFrame:
                 educator_text = join_words(educator_words)
                 achievement_text = join_words(achievement_words)
                 student_text = join_words(student_words)
+
+                # Keep only overall classroom rows, not subject-specific rows
+                if not is_overall_classroom_row(class_text, meta["school"]):
+                    continue
 
                 class_number = extract_class_code(class_text)
                 if not class_number:
