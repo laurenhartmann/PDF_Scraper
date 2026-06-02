@@ -67,81 +67,98 @@ def parse_filename(filename: str) -> Dict[str, str]:
 # Color classification
 # -----------------------------
 
-BAND_COLORS = {
-    "% 1st-20th": np.array([175, 0, 0]),       # dark red
-    "% 21st-40th": np.array([255, 155, 90]),   # orange
-    "% 41st-60th": np.array([255, 225, 90]),   # yellow
-    "% 61st-80th": np.array([95, 195, 105]),   # green
-    "% >80th": np.array([0, 95, 160]),         # dark blue
+# -----------------------------
+# Color classification from PDF vector fills
+# -----------------------------
+
+BAND_HEX = {
+    "% 1st-20th": "#A40000",   # dark red
+    "% 21st-40th": "#FF9D5F",  # orange
+    "% 41st-60th": "#FEE05E",  # yellow
+    "% 61st-80th": "#61C36B",  # green
+    "% >80th": "#0055A0",      # blue
 }
 
-EMPTY_BANDS = {
-    "% 1st-20th": 0,
-    "% 21st-40th": 0,
-    "% 41st-60th": 0,
-    "% 61st-80th": 0,
-    "% >80th": 0,
-}
+EMPTY_BANDS = {k: 0 for k in BAND_HEX.keys()}
 
-def classify_color(rgb: np.ndarray) -> Optional[str]:
+def hex_to_rgb(hex_color: str) -> np.ndarray:
+    hex_color = hex_color.replace("#", "")
+    return np.array([
+        int(hex_color[0:2], 16),
+        int(hex_color[2:4], 16),
+        int(hex_color[4:6], 16),
+    ])
+
+BAND_RGB = {k: hex_to_rgb(v) for k, v in BAND_HEX.items()}
+
+def pdf_color_to_rgb(fill) -> Optional[np.ndarray]:
     """
-    Classify sampled bar background color into percentile band.
+    PyMuPDF fill colors usually come back as floats from 0 to 1.
+    Convert to 0-255 RGB.
     """
-    if rgb is None or np.isnan(rgb).any():
+    if fill is None:
+        return None
+    if len(fill) < 3:
+        return None
+    return np.array([int(round(c * 255)) for c in fill[:3]])
+
+def classify_pdf_fill(fill) -> Optional[str]:
+    rgb = pdf_color_to_rgb(fill)
+    if rgb is None:
         return None
 
     distances = {
-        band: np.linalg.norm(rgb.astype(float) - color.astype(float))
-        for band, color in BAND_COLORS.items()
+        band: np.linalg.norm(rgb.astype(float) - target.astype(float))
+        for band, target in BAND_RGB.items()
     }
     best_band = min(distances, key=distances.get)
 
-    # Conservative threshold; fallback handled later if no band found.
-    if distances[best_band] > 120:
-        return None
+    # Allow small variation from anti-aliasing/rendering
+    if distances[best_band] <= 45:
+        return best_band
 
-    return best_band
+    return None
 
-
-def sample_background_color(
-    page_img: Image.Image,
-    word: Dict,
-    zoom: float = 3.0,
-    pad: int = 8,
-) -> Optional[np.ndarray]:
+def get_bar_segments_for_page(pdf_bytes: bytes, page_index: int) -> List[Dict]:
     """
-    Sample colored background behind a percent label.
-    Ignores near-white and near-black pixels so text doesn't dominate.
+    Pull colored achievement-bar rectangles directly from PDF vector drawings.
     """
-    arr = np.array(page_img.convert("RGB"))
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_index]
+    drawings = page.get_drawings()
+    doc.close()
 
-    x0 = max(int(word["x0"] * zoom) - pad, 0)
-    x1 = min(int(word["x1"] * zoom) + pad, arr.shape[1])
-    y0 = max(int(word["top"] * zoom) - pad, 0)
-    y1 = min(int(word["bottom"] * zoom) + pad, arr.shape[0])
+    segments = []
 
-    patch = arr[y0:y1, x0:x1]
-    if patch.size == 0:
-        return None
+    for d in drawings:
+        band = classify_pdf_fill(d.get("fill"))
+        if band is None:
+            continue
 
-    flat = patch.reshape(-1, 3)
+        rect = d.get("rect")
+        if rect is None:
+            continue
 
-    # Remove black/white/gray-ish text/background; keep saturated colored pixels.
-    maxc = flat.max(axis=1)
-    minc = flat.min(axis=1)
-    saturation = maxc - minc
+        x0, y0, x1, y1 = rect.x0, rect.y0, rect.x1, rect.y1
+        width = x1 - x0
+        height = y1 - y0
 
-    mask = (
-        (maxc < 245) &
-        (minc > 20) &
-        (saturation > 40)
-    )
+        # Filter to distribution bar segments, not median percentile pills or legend dots
+        if x0 < 345:
+            continue
+        if width < 4 or height < 8:
+            continue
 
-    colored = flat[mask]
-    if len(colored) == 0:
-        return None
+        segments.append({
+            "x0": x0,
+            "x1": x1,
+            "top": y0,
+            "bottom": y1,
+            "yc": (y0 + y1) / 2,
+            "band": band,
+        })
 
-    return np.median(colored, axis=0)
+    return segments
 
 
 # -----------------------------
@@ -283,7 +300,7 @@ def extract_rows_from_pdf(pdf_bytes: bytes, filename: str) -> pd.DataFrame:
             if not row_bounds:
                 continue
 
-            page_img = render_pdf_page(pdf_bytes, page_index, zoom=3.0)
+            page_segments = get_bar_segments_for_page(pdf_bytes, page_index)
 
             for y0, y1 in row_bounds:
                 class_words = words_in_region(words, 35, 205, y0, y1)
@@ -309,30 +326,37 @@ def extract_rows_from_pdf(pdf_bytes: bytes, filename: str) -> pd.DataFrame:
 
                 bands = EMPTY_BANDS.copy()
 
-                # Find percent labels in the achievement area and classify by sampled background color.
+                # Colored PDF rectangles for this row
+                row_segments = [
+                    s for s in page_segments
+                    if s["yc"] >= y0 and s["yc"] <= y1
+                ]
+                
+                # Percent values printed inside the bar, left-to-right
                 pct_words = []
                 for w in achievement_words:
                     val = extract_percent_value(word_text(w))
                     if val is None:
                         continue
-
-                    # Skip median percentile pill like 50th/41st; this helper only returns for plain 50 or 50%.
+                
                     txt = word_text(w)
+                
+                    # Skip median percentile pill labels like 83rd, 53rd, 35th
                     if re.search(r"(st|nd|rd|th)$", txt, flags=re.IGNORECASE):
                         continue
-
-                    # Keep words in the distribution-bar area, not the median pill area.
+                
+                    # Distribution bar begins to the right of the median pill
                     if w["x0"] < 350:
                         continue
-
+                
                     pct_words.append((w, val))
-
-                for w, val in pct_words:
-                    rgb = sample_background_color(page_img, w, zoom=3.0)
-                    band = classify_color(rgb)
-                    if band:
-                        bands[band] = val
-
+                
+                pct_words = sorted(pct_words, key=lambda item: item[0]["x0"])
+                row_segments = sorted(row_segments, key=lambda s: s["x0"])
+                
+                # Pair values to colored segments left-to-right
+                for (w, val), seg in zip(pct_words, row_segments):
+                    bands[seg["band"]] = val
                 records.append({
                     **meta,
                     "class_number": str(class_number),
