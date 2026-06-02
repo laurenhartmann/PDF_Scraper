@@ -355,7 +355,7 @@ def extract_rows_from_pdf(pdf_bytes: bytes, filename: str) -> pd.DataFrame:
 
             for y0, y1 in row_bounds:
                 class_words = words_in_region(words, 35, 205, y0, y1)
-                educator_words = words_in_region(words, 205, 305, y0-15, y1+30)
+                educator_words = words_in_region(words, 205, 305, y0-10, y1+20)
                 achievement_words = words_in_region(words, 305, 665, y0, y1)
                 student_words = words_in_region(words, 665, 735, y0, y1)
 
