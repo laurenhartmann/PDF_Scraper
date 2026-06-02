@@ -280,6 +280,44 @@ def is_overall_classroom_row(class_text: str, school: str) -> bool:
 
     pattern = rf"^\s*\(11X{school_3}\.\d+\.00\)"
     return re.search(pattern, class_text) is not None
+
+def clean_teacher_name(teacher_text: str) -> str:
+    """
+    Convert PDF-extracted educator text like:
+      'AMOS, JENNIFER'
+      'AMOS,\\nJENNIFER'
+      'Amos, Jennifer'
+    into:
+      'Amos, Jennifer'
+
+    Also handles multiple educators separated by semicolons.
+    """
+    if teacher_text is None:
+        return ""
+
+    text = str(teacher_text)
+
+    # Normalize whitespace/newlines
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Remove trailing ellipses from truncated names, if present
+    text = text.replace("…", "").replace("...", "").strip()
+
+    # Clean each teacher separately if there are multiple
+    parts = [p.strip() for p in text.split(";") if p.strip()]
+    cleaned_parts = []
+
+    for part in parts:
+        # Normalize comma spacing
+        part = re.sub(r"\s*,\s*", ", ", part)
+        part = re.sub(r"\s+", " ", part).strip()
+
+        # Title case while preserving comma structure
+        part = part.title()
+
+        cleaned_parts.append(part)
+
+    return "; ".join(cleaned_parts)
     
 # -----------------------------
 # Main extraction
@@ -322,7 +360,7 @@ def extract_rows_from_pdf(pdf_bytes: bytes, filename: str) -> pd.DataFrame:
                 student_words = words_in_region(words, 665, 735, y0, y1)
 
                 class_text = join_words(class_words)
-                educator_text = join_words(educator_words)
+                educator_text = clean_teacher_name(join_words(educator_words))
                 achievement_text = join_words(achievement_words)
                 student_text = join_words(student_words)
 
