@@ -1,36 +1,501 @@
+import re
+import difflib
+from typing import Dict, Tuple, Optional, List
+
+import cv2
+import numpy as np
+import pandas as pd
+import pytesseract
+import streamlit as st
+from PIL import Image
+
+
+# -----------------------------
+# Streamlit compatibility helpers
+# -----------------------------
+
+def st_image_compat(img, **kwargs):
+    """Support both newer and older Streamlit args for st.image."""
+    try:
+        return st.image(img, use_container_width=True, **kwargs)
+    except TypeError:
+        return st.image(img, use_column_width=True, **kwargs)
+
+def st_dataframe_compat(df, **kwargs):
+    """Support both newer and older Streamlit args for st.dataframe."""
+    try:
+        return st.dataframe(df, use_container_width=True, **kwargs)
+    except TypeError:
+        return st.dataframe(df, **kwargs)
+
+
+# -----------------------------
+# OCR + Table extraction helpers (robust for 294 variants)
+# -----------------------------
+
+def _norm_token(s: str) -> str:
+    """Normalize OCR token for matching."""
+    s = str(s).lower()
+    s = s.translate(str.maketrans({
+        "|": "1",
+        "i": "1",
+        "l": "1",
+        "o": "0",
+    }))
+    s = s.replace("1", "l").replace("0", "o")
+    s = re.sub(r"[^a-z0-9%()]+", "", s)
+    return s
+
+def _sim(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+def preprocess_for_ocr(pil_img: Image.Image, scale: float = 3.0) -> np.ndarray:
+    """
+    More robust preprocessing for screenshots where text is small or in shaded cells.
+    - Upscale
+    - Grayscale
+    - Adaptive threshold
+    - Auto-invert if needed
+    """
+    rgb = np.array(pil_img.convert("RGB"))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    if scale != 1.0:
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    # Light denoise to stabilize thresholding
+    gray = cv2.bilateralFilter(gray, d=7, sigmaColor=50, sigmaSpace=50)
+
+    # Adaptive threshold tends to beat Otsu on UI screenshots / shaded header cells
+    thr = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        35,  # blockSize
+        11   # C
+    )
+
+    # If the result is mostly white, invert (sometimes OCR prefers dark text on white)
+    white_ratio = (thr > 0).mean()
+    if white_ratio > 0.92:
+        thr = 255 - thr
+
+    return thr
+
+def ocr_to_dataframe(thr_img: np.ndarray) -> pd.DataFrame:
+    """
+    Try multiple PSM modes and pick the result with the most recognized tokens.
+    This helps when tables are not detected under one segmentation mode.
+    """
+    best_df = None
+    best_n = -1
+
+    # 6 = block of text, 4 = single column, 11 = sparse text
+    for psm in [6, 4, 11, 12]:
+        df = pytesseract.image_to_data(
+            thr_img,
+            output_type=pytesseract.Output.DATAFRAME,
+            config=f"--oem 1 --psm {psm}",
+        )
+        df = df.dropna(subset=["text"]).copy()
+        df["text"] = df["text"].astype(str)
+        df = df[df["text"].str.strip() != ""].copy()
+
+        if len(df) > best_n:
+            best_df = df
+            best_n = len(df)
+
+    return best_df if best_df is not None else pd.DataFrame(columns=["text"])
+
+def find_phrase_box_fuzzy(
+    df: pd.DataFrame,
+    required_tokens: List[str],
+    y_max: Optional[int] = None,
+    max_token_gap: int = 3,
+) -> Optional[Dict[str, int]]:
+    """
+    Fuzzy-ish phrase matcher:
+    - Searches optionally within top y_max (None = whole image)
+    - Matches required_tokens in order on the same OCR line, allowing small gaps
+    - Uses light OCR normalization
+    """
+    d = df.copy()
+    if y_max is not None:
+        d = d[d["top"] < y_max].copy()
+
+    d["t"] = d["text"].map(_norm_token)
+
+    for _, grp in d.groupby(["block_num", "par_num", "line_num"]):
+        words = grp.sort_values("left").reset_index(drop=True)
+        toks = words["t"].tolist()
+
+        idxs = []
+        j = 0
+        for req in required_tokens:
+            found = False
+            for k in range(j, min(len(toks), j + max_token_gap + 1)):
+                if toks[k] == req:
+                    idxs.append(k)
+                    j = k + 1
+                    found = True
+                    break
+            if not found:
+                idxs = []
+                break
+
+        if idxs:
+            sel = words.iloc[idxs]
+            left = int(sel["left"].min())
+            top = int(sel["top"].min())
+            right = int((sel["left"] + sel["width"]).max())
+            bottom = int((sel["top"] + sel["height"]).max())
+            return {"left": left, "top": top, "right": right, "bottom": bottom}
+
+    return None
+
+def find_pair_box_similar(
+    df: pd.DataFrame,
+    w1: str,
+    w2: str,
+    y_max: Optional[int] = None,
+    sim_thresh: float = 0.75,
+    max_gap: int = 8,
+) -> Optional[Dict[str, int]]:
+    """Find two-word header like 'total students' even if OCR is slightly wrong."""
+    d = df.copy()
+    if y_max is not None:
+        d = d[d["top"] < y_max].copy()
+    d["t"] = d["text"].map(_norm_token)
+
+    for _, grp in d.groupby(["block_num", "par_num", "line_num"]):
+        words = grp.sort_values("left").reset_index(drop=True)
+        toks = words["t"].tolist()
+
+        idx1s = [i for i, t in enumerate(toks) if _sim(t, w1) >= sim_thresh]
+        if not idx1s:
+            continue
+
+        for i in idx1s:
+            for j in range(i + 1, min(len(toks), i + 1 + max_gap)):
+                if _sim(toks[j], w2) >= sim_thresh:
+                    sel = words.iloc[[i, j]]
+                    left = int(sel["left"].min())
+                    top = int(sel["top"].min())
+                    right = int((sel["left"] + sel["width"]).max())
+                    bottom = int((sel["top"] + sel["height"]).max())
+                    return {"left": left, "top": top, "right": right, "bottom": bottom}
+
+    return None
+
+def find_single_box_similar(
+    df: pd.DataFrame,
+    target: str,
+    y_max: Optional[int] = None,
+    sim_thresh: float = 0.72,
+) -> Optional[Dict[str, int]]:
+    """Find a single token header like 'nodata' even if OCR is slightly wrong."""
+    d = df.copy()
+    if y_max is not None:
+        d = d[d["top"] < y_max].copy()
+    d["t"] = d["text"].map(_norm_token)
+
+    best_row = None
+    best_score = 0.0
+    for _, r in d.iterrows():
+        sc = _sim(r["t"], target)
+        if sc > best_score:
+            best_score = sc
+            best_row = r
+
+    if best_row is not None and best_score >= sim_thresh:
+        left = int(best_row["left"])
+        top = int(best_row["top"])
+        right = int(best_row["left"] + best_row["width"])
+        bottom = int(best_row["top"] + best_row["height"])
+        return {"left": left, "top": top, "right": right, "bottom": bottom}
+
+    return None
+
+def find_pair_box_similar_line(
+    df: pd.DataFrame,
+    w1: str,
+    w2: str,
+    y_max: Optional[int] = None,
+    sim_thresh: float = 0.70,
+    max_gap: int = 10,
+) -> Optional[Dict[str, int]]:
+    """Similarity-based two-token header finder (same line)."""
+    d = df.copy()
+    if y_max is not None:
+        d = d[d["top"] < y_max].copy()
+    d["t"] = d["text"].map(_norm_token)
+
+    for _, grp in d.groupby(["block_num", "par_num", "line_num"]):
+        words = grp.sort_values("left").reset_index(drop=True)
+        toks = words["t"].tolist()
+        for i, t in enumerate(toks):
+            if _sim(t, w1) >= sim_thresh:
+                for j in range(i + 1, min(len(toks), i + 1 + max_gap)):
+                    if _sim(toks[j], w2) >= sim_thresh:
+                        sel = words.iloc[[i, j]]
+                        return {
+                            "left": int(sel["left"].min()),
+                            "top": int(sel["top"].min()),
+                            "right": int((sel["left"] + sel["width"]).max()),
+                            "bottom": int((sel["top"] + sel["height"]).max()),
+                        }
+    return None
+
+
+def infer_official_class_range_from_body(df_words: pd.DataFrame, pad: int = 120) -> Optional[Tuple[int, int]]:
+    """
+    If we can't find the 'Official class' header, infer the column range by finding
+    3-digit class codes in the table body and taking the leftmost dense cluster.
+    """
+    d = df_words.copy()
+    d["text"] = d["text"].astype(str)
+
+    # Find likely class codes (3 digits, common OCR corrections happen later)
+    code_mask = d["text"].str.contains(r"\b\d{3}\b", regex=True, na=False)
+    codes = d[code_mask].copy()
+    if codes.empty:
+        return None
+
+    # Use x-center to find the leftmost cluster of codes
+    codes["xc"] = codes["left"] + codes["width"] / 2
+    # take leftmost 30% of code positions as "class column candidates"
+    cutoff = np.quantile(codes["xc"], 0.30)
+    candidates = codes[codes["xc"] <= cutoff]
+    if candidates.empty:
+        candidates = codes.nsmallest(min(len(codes), 50), "xc")
+
+    left = int(candidates["left"].min()) - pad
+    right = int((candidates["left"] + candidates["width"]).max()) + pad
+    return (left, right)
+
+def get_column_ranges(df_words: pd.DataFrame) -> Tuple[Dict[str, Tuple[int, int]], int]:
+    dfw = df_words.copy()
+    dfw["text"] = dfw["text"].astype(str)
+
+    # --- Official class: try multiple ways ---
+    official_box = (
+        find_phrase_box_fuzzy(dfw, ["official", "class"], y_max=1200, max_token_gap=10)
+        or find_pair_box_similar_line(dfw, "official", "class", y_max=1500, sim_thresh=0.70, max_gap=12)
+        or find_phrase_box_fuzzy(dfw, ["officialclass"], y_max=None, max_token_gap=12)
+    )
+
+    # If header still not found, infer column range from body class codes
+    official_range = None
+    if official_box is not None:
+        pad = 140
+        official_range = (official_box["left"] - pad, official_box["right"] + pad)
+    else:
+        inferred = infer_official_class_range_from_body(dfw, pad=140)
+        if inferred is not None:
+            official_range = inferred
+
+    # --- On grade header (your current approach) ---
+    ongrade_box = (
+        find_phrase_box_fuzzy(dfw, ["on", "grade", "level", "(%)"], y_max=1200, max_token_gap=10)
+        or find_phrase_box_fuzzy(dfw, ["on", "grade", "level"], y_max=2000, max_token_gap=12)
+        or find_phrase_box_fuzzy(dfw, ["ongradelevel"], y_max=None, max_token_gap=12)
+    )
+
+    # --- No data + Total students (your current similarity logic) ---
+    no_data_box = (
+        find_pair_box_similar(dfw, "no", "data", y_max=1500, sim_thresh=0.72, max_gap=14)
+        or find_single_box_similar(dfw, "nodata", y_max=1500, sim_thresh=0.70)
+        or find_pair_box_similar(dfw, "no", "data", y_max=None, sim_thresh=0.72, max_gap=18)
+        or find_single_box_similar(dfw, "nodata", y_max=None, sim_thresh=0.70)
+    )
+
+    total_students_box = (
+        find_pair_box_similar(dfw, "total", "students", y_max=1500, sim_thresh=0.72, max_gap=16)
+        or find_pair_box_similar(dfw, "total", "student", y_max=1500, sim_thresh=0.72, max_gap=16)
+        or find_pair_box_similar(dfw, "total", "students", y_max=None, sim_thresh=0.72, max_gap=22)
+        or find_pair_box_similar(dfw, "total", "student", y_max=None, sim_thresh=0.72, max_gap=22)
+    )
+
+    # Validate what we need
+    missing = []
+    if official_range is None:
+        missing.append("official_class")
+    if ongrade_box is None:
+        missing.append("on_grade")
+    if no_data_box is None:
+        missing.append("no_data")
+    if total_students_box is None:
+        missing.append("total_students")
+
+    if missing:
+        raise ValueError(f"Could not find required header(s): {', '.join(missing)}")
+
+    pad = 140
+    ranges = {
+        "official_class": official_range,
+        "on_grade": (ongrade_box["left"] - pad, ongrade_box["right"] + pad),
+        "no_data": (no_data_box["left"] - pad, no_data_box["right"] + pad),
+        "total_students": (total_students_box["left"] - pad, total_students_box["right"] + pad),
+    }
+
+    y_start = max(ongrade_box["bottom"], no_data_box["bottom"], total_students_box["bottom"]) + 20
+    return ranges, y_start
+
+def cluster_rows(df: pd.DataFrame, y_start: int, y_gap: int = 30) -> List[pd.DataFrame]:
+    """Cluster word boxes into table rows using y-centers and a gap threshold."""
+    d = df[df["top"] > y_start].copy()
+    d["yc"] = d["top"] + d["height"] / 2
+    d = d.sort_values("yc")
+
+    rows: List[pd.DataFrame] = []
+    current = []
+    last_y = None
+
+    for _, r in d.iterrows():
+        if last_y is None or (r["yc"] - last_y) <= y_gap:
+            current.append(r)
+        else:
+            rows.append(pd.DataFrame(current))
+            current = [r]
+        last_y = r["yc"]
+
+    if current:
+        rows.append(pd.DataFrame(current))
+
+    return rows
+
+def parse_int(text: str) -> Optional[int]:
+    m = re.search(r"\d+", str(text))
+    return int(m.group()) if m else None
+
+def parse_percent(text: str) -> Optional[float]:
+    """Return proficiency as a proportion (e.g., '41%' -> 0.41)."""
+    s = str(text)
+    if "%" not in s:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*%", s)
+    return float(m.group(1)) / 100.0 if m else None
+
+def normalize_class_code(text: str) -> Optional[str]:
+    """Extract a 3-digit class code with light OCR error correction."""
+    t = str(text).strip()
+    if not t:
+        return None
+
+    first = t.split()[0]
+    trans = str.maketrans({
+        "$": "5",
+        "S": "5",
+        "s": "5",
+        "O": "0",
+        "o": "0",
+        "I": "1",
+        "l": "1",
+        "|": "1",
+    })
+    first = first.translate(trans)
+
+    m = re.search(r"(\d{3})", first)
+    if m:
+        return m.group(1)
+
+    tt = t.translate(trans)
+    m = re.search(r"(\d{3})", tt)
+    return m.group(1) if m else None
+
+def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
+    """
+    Extract:
+      - class_code (Official class)
+      - proficiency (On grade level (%), stored as proportion)
+      - n_size (Total students - No data)
+    """
+    thr = preprocess_for_ocr(pil_img, scale=3.0)
+    words = ocr_to_dataframe(thr)
+
+    ranges, y_start = get_column_ranges(words)
+    rows = cluster_rows(words, y_start=y_start, y_gap=30)
+
+    records = []
+    for rowdf in rows:
+        rowdf = rowdf.copy()
+        rowdf["xc"] = rowdf["left"] + rowdf["width"] / 2
+
+        def text_in(col: str) -> str:
+            l, r = ranges[col]
+            sel = rowdf[(rowdf["xc"] >= l) & (rowdf["xc"] <= r)].sort_values("left")
+            return " ".join(sel["text"].astype(str).tolist()).strip()
+
+        class_code = normalize_class_code(text_in("official_class"))
+        if not class_code:
+            continue
+
+        proficiency = parse_percent(text_in("on_grade"))
+
+        total_students = parse_int(text_in("total_students"))
+        no_data = parse_int(text_in("no_data")) or 0
+        if total_students is None:
+            continue
+
+        n_size = total_students - no_data
+
+        records.append({
+            "class_code": str(class_code),
+            "proficiency": proficiency,
+            "n_size": int(n_size),
+        })
+
+    out = pd.DataFrame(records)
+    if not out.empty:
+        out = out.drop_duplicates(subset=["class_code"], keep="first").reset_index(drop=True)
+    return out
+
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+
+st.set_page_config(page_title="Image-Table Extractor", layout="wide")
+st.title("PNG Table Extractor")
+
+with st.sidebar:
+    st.header("Dataset-level fields")
+    district = st.text_input("District", value="")
+    assessment = st.selectbox("Assessment", ("Acadience","iReady","MAP","PELI"))
+    content = st.selectbox("Content area", ("ELA","Pre-K","Math"))
+    period = st.selectbox("Time of Year",("Beginning","Mid","End"))
+
+st.subheader("Upload Images")
+uploaded_files = st.file_uploader(
+    "Upload one or more images",
+    type=["png"],
+    accept_multiple_files=True,
+)
+
+if not uploaded_files:
+    st.info("Upload at least one image to begin.")
+    st.stop()
+
+
 st.subheader("File fields")
 
 # Store per-file metadata in session_state so it persists between reruns
 if "file_meta" not in st.session_state:
     st.session_state["file_meta"] = {}
 
-period_options = ["Beginning", "Mid", "End"]
-
 # Build metadata inputs for each uploaded file
 for idx, f in enumerate(uploaded_files, start=1):
-    key_base = f.name  # unique enough for your use case
-    if key_base not in st.session_state["file_meta"]:
-        st.session_state["file_meta"][key_base] = {"site": "", "period": period_options[0]}
+    fname = f.name
+    if fname not in st.session_state["file_meta"]:
+        st.session_state["file_meta"][fname] = {"site": ""}
 
-    with st.expander(f"{idx}. {f.name}", expanded=(idx == 1)):
-        col1, col2 = st.columns(2)
-        with col1:
-            st.session_state["file_meta"][key_base]["site"] = st.text_input(
-                "Site name",
-                value=st.session_state["file_meta"][key_base]["site"],
-                key=f"site_{key_base}",
-            )
-        with col2:
-            st.session_state["file_meta"][key_base]["period"] = st.selectbox(
-                "Period",
-                period_options,
-                index=period_options.index(st.session_state["file_meta"][key_base]["period"]),
-                key=f"period_{key_base}",
-            )
-
-        # Optional preview
-        pil_img_preview = Image.open(f)
-        st_image_compat(pil_img_preview, caption=f.name)
+    with st.expander(f"{idx}. {fname}", expanded=(idx == 1)):
+        st.session_state["file_meta"][fname]["site"] = st.text_input(
+            "Site name",
+            value=st.session_state["file_meta"][fname]["site"],
+            key=f"site_{fname}",
+        )
+        
 
 
 st.divider()
@@ -56,7 +521,6 @@ if extract_all:
             fname = f.name
             meta = st.session_state["file_meta"][fname]
             site = meta["site"]
-            period = meta["period"]
 
             status.write(f"Extracting {i}/{len(uploaded_files)}: **{fname}**")
             try:
