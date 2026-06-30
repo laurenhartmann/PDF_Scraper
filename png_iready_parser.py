@@ -464,9 +464,12 @@ def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
         ].copy().sort_values("left")
 
         tokens = rowdf["text"].astype(str).tolist()
-       
+
         # Find proficiency token
-        pct_tokens = [t for t in tokens if "%" in t or re.search(r"\d+\s*[%x]", t)]
+        pct_tokens = [
+            t for t in tokens
+            if "%" in t or re.search(r"\d+\s*[%x]", t)
+        ]
 
         if not pct_tokens:
             continue
@@ -481,33 +484,39 @@ def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
             parsed = parse_int(tok)
             if parsed is not None:
                 numeric_after_pct.append(parsed)
-        
-        
-        # Need the five band-count columns:
-        # mid, early, one below, two below, three+ below
 
+        if len(numeric_after_pct) < 5:
+            continue
+
+        # First five numeric values after proficiency should be:
+        # mid, early, one_below, two_below, three_below
         band_sum = sum(numeric_after_pct[:5])
+
+        # If OCR captured no_data and total_students, use them as a consistency check.
+        # Expected full pattern:
+        # mid, early, one_below, two_below, three_below, no_data, total_students
         if len(numeric_after_pct) >= 7:
             no_data = numeric_after_pct[-2]
             total_students = numeric_after_pct[-1]
 
-            # Happy path
             if band_sum <= total_students:
+                # Happy path: band counts are internally possible
                 n_size = band_sum
-        
             else:
-                # Use total - no_data
-                n_size = total_students - no_data
-        
-                # Last resort: common OCR error where 0 -> 6
-                if n_size < 0 or n_size > total_students:
-                    if no_data == 6:
-                        n_size = total_students
-                    else:
-                        # Fall back to the total if we can't reconcile
-                        n_size = total_students
-        
+                # Band sum is impossible, likely due to OCR reading 0 as 6.
+                # Prefer total students minus no data.
+                candidate_n_size = total_students - no_data
+
+                if 0 <= candidate_n_size <= total_students:
+                    n_size = candidate_n_size
+                elif no_data == 6:
+                    # Last resort: no_data was likely a misread 0.
+                    n_size = total_students
+                else:
+                    # Final fallback: keep the safest possible value.
+                    n_size = total_students
         else:
+            # Fallback if OCR missed no_data / total_students
             n_size = band_sum
 
         records.append({
