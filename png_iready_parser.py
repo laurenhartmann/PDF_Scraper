@@ -503,13 +503,7 @@ def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
                 # Happy path: band counts are internally possible
                 n_size = band_sum
             else:
-                # Band sum is impossible, likely due to OCR reading 0 as 6.
-                # Prefer total students minus no data.
-                candidate_n_size = total_students - no_data
-
-                if 0 <= candidate_n_size <= total_students:
-                    n_size = candidate_n_size
-                elif no_data == 6:
+                if no_data == 6:
                     # Last resort: no_data was likely a misread 0.
                     n_size = total_students
                 else:
