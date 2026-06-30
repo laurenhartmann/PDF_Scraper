@@ -276,69 +276,92 @@ def infer_official_class_range_from_body(df_words: pd.DataFrame, pad: int = 120)
 def get_column_ranges(df_words: pd.DataFrame) -> Tuple[Dict[str, Tuple[int, int]], int]:
     dfw = df_words.copy()
     dfw["text"] = dfw["text"].astype(str)
+    dfw["t"] = dfw["text"].map(_norm_token)
 
-    # --- Official class: try multiple ways ---
-    official_box = (
-        find_phrase_box_fuzzy(dfw, ["official", "class"], y_max=1200, max_token_gap=10)
-        or find_pair_box_similar_line(dfw, "official", "class", y_max=1500, sim_thresh=0.70, max_gap=12)
-        or find_phrase_box_fuzzy(dfw, ["officialclass"], y_max=None, max_token_gap=12)
-    )
+    # Find the actual table header row by locating the line with Official class + Total students
+    header_line = None
 
-    # If header still not found, infer column range from body class codes
-    official_range = None
-    if official_box is not None:
-        pad = 140
-        official_range = (official_box["left"] - pad, official_box["right"] + pad)
-    else:
-        inferred = infer_official_class_range_from_body(dfw, pad=140)
-        if inferred is not None:
-            official_range = inferred
+    for _, grp in dfw.groupby(["block_num", "par_num", "line_num"]):
+        line = grp.sort_values("left").copy()
+        toks = line["t"].tolist()
+        joined = " ".join(toks)
 
-    # --- On grade header (your current approach) ---
-    ongrade_box = (
-        find_phrase_box_fuzzy(dfw, ["on", "grade", "level", "(%)"], y_max=1200, max_token_gap=10)
-        or find_phrase_box_fuzzy(dfw, ["on", "grade", "level"], y_max=2000, max_token_gap=12)
-        or find_phrase_box_fuzzy(dfw, ["ongradelevel"], y_max=None, max_token_gap=12)
-    )
+        has_official = "official" in toks and "class" in toks
+        has_total = "total" in toks and ("students" in toks or "student" in toks)
 
-    # --- No data + Total students (your current similarity logic) ---
-    no_data_box = (
-        find_pair_box_similar(dfw, "no", "data", y_max=1500, sim_thresh=0.72, max_gap=14)
-        or find_single_box_similar(dfw, "nodata", y_max=1500, sim_thresh=0.70)
-        or find_pair_box_similar(dfw, "no", "data", y_max=None, sim_thresh=0.72, max_gap=18)
-        or find_single_box_similar(dfw, "nodata", y_max=None, sim_thresh=0.70)
-    )
+        if has_official and has_total:
+            header_line = line
+            break
 
-    total_students_box = (
-        find_pair_box_similar(dfw, "total", "students", y_max=1500, sim_thresh=0.72, max_gap=16)
-        or find_pair_box_similar(dfw, "total", "student", y_max=1500, sim_thresh=0.72, max_gap=16)
-        or find_pair_box_similar(dfw, "total", "students", y_max=None, sim_thresh=0.72, max_gap=22)
-        or find_pair_box_similar(dfw, "total", "student", y_max=None, sim_thresh=0.72, max_gap=22)
-    )
+    if header_line is None:
+        raise ValueError("Could not find the table header row.")
 
-    # Validate what we need
+    def box_for_tokens(tokens):
+        toks = header_line["t"].tolist()
+
+        for i in range(len(toks)):
+            j = i
+            matched = []
+
+            for token in tokens:
+                found = False
+                while j < len(toks):
+                    if _sim(toks[j], token) >= 0.70:
+                        matched.append(j)
+                        j += 1
+                        found = True
+                        break
+                    j += 1
+
+                if not found:
+                    matched = []
+                    break
+
+            if matched:
+                sel = header_line.iloc[matched]
+                return {
+                    "left": int(sel["left"].min()),
+                    "top": int(sel["top"].min()),
+                    "right": int((sel["left"] + sel["width"]).max()),
+                    "bottom": int((sel["top"] + sel["height"]).max()),
+                }
+
+        return None
+
+    official_box = box_for_tokens(["official", "class"])
+    ongrade_box = box_for_tokens(["on", "grade", "level"])
+    nodata_box = box_for_tokens(["nodata"]) or box_for_tokens(["no", "data"])
+    total_box = box_for_tokens(["total", "students"]) or box_for_tokens(["total", "student"])
+
     missing = []
-    if official_range is None:
+    if official_box is None:
         missing.append("official_class")
     if ongrade_box is None:
         missing.append("on_grade")
-    if no_data_box is None:
+    if nodata_box is None:
         missing.append("no_data")
-    if total_students_box is None:
+    if total_box is None:
         missing.append("total_students")
 
     if missing:
         raise ValueError(f"Could not find required header(s): {', '.join(missing)}")
 
     pad = 140
+
     ranges = {
-        "official_class": official_range,
+        "official_class": (official_box["left"] - pad, official_box["right"] + pad),
         "on_grade": (ongrade_box["left"] - pad, ongrade_box["right"] + pad),
-        "no_data": (no_data_box["left"] - pad, no_data_box["right"] + pad),
-        "total_students": (total_students_box["left"] - pad, total_students_box["right"] + pad),
+        "no_data": (nodata_box["left"] - pad, nodata_box["right"] + pad),
+        "total_students": (total_box["left"] - pad, total_box["right"] + pad),
     }
 
-    y_start = max(ongrade_box["bottom"], no_data_box["bottom"], total_students_box["bottom"]) + 20
+    y_start = max(
+        official_box["bottom"],
+        ongrade_box["bottom"],
+        nodata_box["bottom"],
+        total_box["bottom"],
+    ) + 20
+
     return ranges, y_start
 
 def cluster_rows(df: pd.DataFrame, y_start: int, y_gap: int = 30) -> List[pd.DataFrame]:
@@ -367,12 +390,13 @@ def cluster_rows(df: pd.DataFrame, y_start: int, y_gap: int = 30) -> List[pd.Dat
 def parse_int(text: str) -> Optional[int]:
     m = re.search(r"\d+", str(text))
     return int(m.group()) if m else None
-
+    
 def parse_percent(text: str) -> Optional[float]:
-    """Return proficiency as a proportion (e.g., '41%' -> 0.41)."""
-    s = str(text)
-    if "%" not in s:
-        return None
+    s = str(text).strip()
+
+    # OCR sometimes reads 0% as O% or Ox
+    s = s.replace("O", "0").replace("o", "0").replace("x", "%")
+
     m = re.search(r"(\d+(?:\.\d+)?)\s*%", s)
     return float(m.group(1)) / 100.0 if m else None
 
