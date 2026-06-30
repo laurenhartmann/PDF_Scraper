@@ -510,8 +510,13 @@ def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
                     # Final fallback: keep the safest possible value.
                     n_size = total_students
         else:
+            no_data = numeric_after_pct[-2]
+            total_students = numeric_after_pct[-1]
             # Fallback if OCR missed no_data / total_students
-            n_size = band_sum - 6
+            if band_sum <= total_students:
+                n_size = band_sum
+            else:
+                n_size = total_students
 
         records.append({
             "class_code": str(class_code),
