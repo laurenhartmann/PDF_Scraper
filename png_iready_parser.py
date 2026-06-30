@@ -426,6 +426,7 @@ def normalize_class_code(text: str) -> Optional[str]:
     tt = t.translate(trans)
     m = re.search(r"(\d{3})", tt)
     return m.group(1) if m else None
+
 def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
     thr = preprocess_for_ocr(pil_img, scale=3.0)
     words = ocr_to_dataframe(thr)
@@ -438,17 +439,35 @@ def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
     words["xc"] = words["left"] + words["width"] / 2
     words["yc"] = words["top"] + words["height"] / 2
 
-    # Keep lower portion where table lives
-    table_words = words[words["top"] > words["top"].quantile(0.40)].copy()
+    # Only table body, not chart
+    table_words = words[words["top"] > words["top"].quantile(0.45)].copy()
 
-    # Find likely class-code anchors
+    # Only class codes in the far-left table column
     anchors = table_words[
-        table_words["text"].astype(str).str.match(r"^\d{3}$", na=False)
+        table_words["text"].str.match(r"^\d{3}$", na=False)
     ].copy()
 
     if anchors.empty:
         return pd.DataFrame(columns=["class_code", "proficiency", "n_size"])
 
+    # Keep only leftmost class-code anchors, ignoring chart axis labels
+    left_cutoff = anchors["left"].quantile(0.25) + 100
+    anchors = anchors[anchors["left"] <= left_cutoff].copy()
+
+    # Column centers from your table layout, scaled OCR coordinates
+    # These are: proficiency, mid, early, one below, two below, three+ below, no data, total students
+    col_centers = {
+        "proficiency": 2280,
+        "mid": 2769,
+        "early": 3261,
+        "one_below": 3752,
+        "two_below": 4245,
+        "three_below": 4736,
+        "no_data": 5228,
+        "total_students": 5721,
+    }
+
+    tolerance = 110
     records = []
 
     for _, anchor in anchors.iterrows():
@@ -456,36 +475,32 @@ def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
         if not class_code:
             continue
 
-        # Pull only words horizontally aligned with this class-code row
         rowdf = table_words[
-            (table_words["yc"] >= anchor["yc"] - 18) &
-            (table_words["yc"] <= anchor["yc"] + 18)
-        ].copy().sort_values("left")
+            (table_words["yc"] >= anchor["yc"] - 22) &
+            (table_words["yc"] <= anchor["yc"] + 22)
+        ].copy()
 
-        tokens = rowdf["text"].astype(str).tolist()
+        row_values = {}
 
-        # Find proficiency token
-        pct_tokens = [t for t in tokens if "%" in t or re.search(r"\d+\s*[%x]", t)]
-        if not pct_tokens:
-            continue
+        for col, center in col_centers.items():
+            cell = rowdf[
+                (rowdf["xc"] >= center - tolerance) &
+                (rowdf["xc"] <= center + tolerance)
+            ].sort_values("left")
 
-        proficiency = parse_percent(pct_tokens[0])
+            cell_text = " ".join(cell["text"].astype(str).tolist()).strip()
+            row_values[col] = cell_text
 
-        # Get numeric tokens after proficiency
-        pct_index = tokens.index(pct_tokens[0])
-        numeric_after_pct = []
+        proficiency = parse_percent(row_values["proficiency"])
 
-        for tok in tokens[pct_index + 1:]:
-            parsed = parse_int(tok)
-            if parsed is not None:
-                numeric_after_pct.append(parsed)
+        # Missing count cells are usually skipped zeroes, so treat missing as 0
+        mid = parse_int(row_values["mid"]) or 0
+        early = parse_int(row_values["early"]) or 0
+        one_below = parse_int(row_values["one_below"]) or 0
+        two_below = parse_int(row_values["two_below"]) or 0
+        three_below = parse_int(row_values["three_below"]) or 0
 
-        # Need the five band-count columns:
-        # mid, early, one below, two below, three+ below
-        if len(numeric_after_pct) < 5:
-            continue
-
-        n_size = sum(numeric_after_pct[:5])
+        n_size = mid + early + one_below + two_below + three_below
 
         records.append({
             "class_code": str(class_code),
