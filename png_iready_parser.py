@@ -489,16 +489,24 @@ def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
             continue
 
         proficiency = parse_percent(values[0])
-        no_data = parse_int(values[-2]) or 0
-        total_students = parse_int(values[-1])
-
-        if total_students is None:
+        # After proficiency, the next five numeric columns are:
+        # Mid on grade level, Early on grade level, One below, Two below, Three+ below
+        band_values = []
+        
+        for v in values[1:]:
+            parsed = parse_int(v)
+            if parsed is not None:
+                band_values.append(parsed)
+        
+        if len(band_values) < 5:
             continue
-
+        
+        n_size = sum(band_values[:5])
+        
         records.append({
             "class_code": str(class_code),
             "proficiency": proficiency,
-            "n_size": int(total_students - no_data),
+            "n_size": int(n_size),
         })
 
     out = pd.DataFrame(records)
