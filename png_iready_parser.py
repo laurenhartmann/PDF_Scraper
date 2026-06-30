@@ -495,28 +495,21 @@ def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
         # If OCR captured no_data and total_students, use them as a consistency check.
         # Expected full pattern:
         # mid, early, one_below, two_below, three_below, no_data, total_students
-        if len(numeric_after_pct) >= 7:
-            no_data = numeric_after_pct[-2]
-            total_students = numeric_after_pct[-1]
+        
+        no_data = numeric_after_pct[-2]
+        total_students = numeric_after_pct[-1]
 
-            if band_sum <= total_students:
-                # Happy path: band counts are internally possible
-                n_size = band_sum
-            else:
-                if no_data == 6:
-                    # Last resort: no_data was likely a misread 0.
-                    n_size = total_students
-                else:
-                    # Final fallback: keep the safest possible value.
-                    n_size = total_students
+        if band_sum <= total_students:
+            # Happy path: band counts are internally possible
+            n_size = band_sum
         else:
-            no_data = numeric_after_pct[-2]
-            total_students = numeric_after_pct[-1]
-            # Fallback if OCR missed no_data / total_students
-            if band_sum <= total_students:
-                n_size = band_sum
-            else:
+            if no_data == 6:
+                # Last resort: no_data was likely a misread 0.
                 n_size = total_students
+            else:
+                # Final fallback: keep the safest possible value.
+                n_size = total_students
+       
 
         records.append({
             "class_code": str(class_code),
