@@ -466,16 +466,16 @@ def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
         tokens = rowdf["text"].astype(str).tolist()
         ### Debug test #1
         if class_code in ["702", "821"]:
-            print("\n----------------")
-            print("CLASS:", class_code)
-            print("TOKENS:", tokens)
-            print(rowdf[["text", "left", "top", "xc", "yc"]].to_string(index=False))
+            with st.expander(f"Debug row {class_code}", expanded=True):
+                st.write("Tokens:", tokens)
+                st.dataframe(
+                    rowdf[["text", "left", "top", "xc", "yc"]]
+                    .sort_values("left")
+                    .reset_index(drop=True)
+                )
         # Find proficiency token
         pct_tokens = [t for t in tokens if "%" in t or re.search(r"\d+\s*[%x]", t)]
 
-        ### Debug test #2
-        if class_code in ["702", "821"]:
-            print("PCT TOKENS:", pct_tokens)
         if not pct_tokens:
             continue
 
@@ -489,10 +489,11 @@ def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
             parsed = parse_int(tok)
             if parsed is not None:
                 numeric_after_pct.append(parsed)
-        ### Debug test #3
+        ### Debug test #2
         if class_code in ["702", "821"]:
-            print("NUMERIC AFTER PCT:", numeric_after_pct)
-            print("N SIZE CALC:", sum(numeric_after_pct[:5]) if len(numeric_after_pct) >= 5 else None)
+            st.write("Percent token:", pct_tokens)
+            st.write("Numeric after percent:", numeric_after_pct)
+            st.write("Calculated n_size:", sum(numeric_after_pct[:5]))
         
         # Need the five band-count columns:
         # mid, early, one below, two below, three+ below
