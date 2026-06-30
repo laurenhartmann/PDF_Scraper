@@ -511,7 +511,7 @@ def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
                     n_size = total_students
         else:
             # Fallback if OCR missed no_data / total_students
-            n_size = band_sum
+            n_size = total_students
 
         records.append({
             "class_code": str(class_code),
