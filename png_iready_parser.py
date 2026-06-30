@@ -429,49 +429,83 @@ def normalize_class_code(text: str) -> Optional[str]:
 
 def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
     """
-    Extract:
-      - class_code (Official class)
-      - proficiency (On grade level (%), stored as proportion)
-      - n_size (Total students - No data)
+    Extract rows by reading table-body rows, not table headers.
+
+    Expected row structure:
+      class_code | proficiency | mid | early | one below | two below | three+ below | no data | total students
+
+    Output:
+      class_code, proficiency, n_size
     """
     thr = preprocess_for_ocr(pil_img, scale=3.0)
     words = ocr_to_dataframe(thr)
 
-    ranges, y_start = get_column_ranges(words)
-    rows = cluster_rows(words, y_start=y_start, y_gap=30)
+    if words.empty:
+        return pd.DataFrame(columns=["class_code", "proficiency", "n_size"])
+
+    words = words.copy()
+    words["text"] = words["text"].astype(str)
+    words["xc"] = words["left"] + words["width"] / 2
+    words["yc"] = words["top"] + words["height"] / 2
+
+    # Ignore the chart/title area; keep lower half-ish where the table lives
+    y_cutoff = words["top"].quantile(0.40)
+    table_words = words[words["top"] > y_cutoff].copy()
+
+    rows = cluster_rows(table_words, y_start=int(table_words["top"].min()) - 5, y_gap=35)
 
     records = []
+
     for rowdf in rows:
-        rowdf = rowdf.copy()
-        rowdf["xc"] = rowdf["left"] + rowdf["width"] / 2
+        rowdf = rowdf.copy().sort_values("left")
+        row_text = " ".join(rowdf["text"].astype(str).tolist())
 
-        def text_in(col: str) -> str:
-            l, r = ranges[col]
-            sel = rowdf[(rowdf["xc"] >= l) & (rowdf["xc"] <= r)].sort_values("left")
-            return " ".join(sel["text"].astype(str).tolist()).strip()
+        class_code = normalize_class_code(row_text)
 
-        class_code = normalize_class_code(text_in("official_class"))
+        # Skip non-class rows like HOM, All, headers, etc.
         if not class_code:
             continue
 
-        proficiency = parse_percent(text_in("on_grade"))
+        # Pull row values from left to right after the class code
+        tokens = rowdf["text"].astype(str).tolist()
 
-        total_students = parse_int(text_in("total_students"))
-        no_data = parse_int(text_in("no_data")) or 0
-        if total_students is None:
+        # Remove the class code token from the front
+        values = []
+        class_seen = False
+
+        for tok in tokens:
+            if not class_seen and normalize_class_code(tok) == class_code:
+                class_seen = True
+                continue
+
+            if class_seen:
+                cleaned = tok.strip()
+                if cleaned:
+                    values.append(cleaned)
+
+        # Expected values:
+        # [proficiency, mid, early, one below, two below, three+ below, no data, total students]
+        if len(values) < 8:
             continue
 
-        n_size = total_students - no_data
+        proficiency = parse_percent(values[0])
+        no_data = parse_int(values[-2]) or 0
+        total_students = parse_int(values[-1])
+
+        if total_students is None:
+            continue
 
         records.append({
             "class_code": str(class_code),
             "proficiency": proficiency,
-            "n_size": int(n_size),
+            "n_size": int(total_students - no_data),
         })
 
     out = pd.DataFrame(records)
+
     if not out.empty:
         out = out.drop_duplicates(subset=["class_code"], keep="first").reset_index(drop=True)
+
     return out
 
 
