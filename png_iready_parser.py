@@ -426,17 +426,7 @@ def normalize_class_code(text: str) -> Optional[str]:
     tt = t.translate(trans)
     m = re.search(r"(\d{3})", tt)
     return m.group(1) if m else None
-
 def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
-    """
-    Extract rows by reading table-body rows, not table headers.
-
-    Expected row structure:
-      class_code | proficiency | mid | early | one below | two below | three+ below | no data | total students
-
-    Output:
-      class_code, proficiency, n_size
-    """
     thr = preprocess_for_ocr(pil_img, scale=3.0)
     words = ocr_to_dataframe(thr)
 
@@ -448,61 +438,55 @@ def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
     words["xc"] = words["left"] + words["width"] / 2
     words["yc"] = words["top"] + words["height"] / 2
 
-    # Ignore the chart/title area; keep lower half-ish where the table lives
-    y_cutoff = words["top"].quantile(0.40)
-    table_words = words[words["top"] > y_cutoff].copy()
+    # Keep lower portion where table lives
+    table_words = words[words["top"] > words["top"].quantile(0.40)].copy()
 
-    rows = cluster_rows(table_words, y_start=int(table_words["top"].min()) - 5, y_gap=35)
+    # Find likely class-code anchors
+    anchors = table_words[
+        table_words["text"].astype(str).str.match(r"^\d{3}$", na=False)
+    ].copy()
+
+    if anchors.empty:
+        return pd.DataFrame(columns=["class_code", "proficiency", "n_size"])
 
     records = []
 
-    for rowdf in rows:
-        rowdf = rowdf.copy().sort_values("left")
-        row_text = " ".join(rowdf["text"].astype(str).tolist())
-
-        class_code = normalize_class_code(row_text)
-
-        # Skip non-class rows like HOM, All, headers, etc.
+    for _, anchor in anchors.iterrows():
+        class_code = normalize_class_code(anchor["text"])
         if not class_code:
             continue
 
-        # Pull row values from left to right after the class code
+        # Pull only words horizontally aligned with this class-code row
+        rowdf = table_words[
+            (table_words["yc"] >= anchor["yc"] - 18) &
+            (table_words["yc"] <= anchor["yc"] + 18)
+        ].copy().sort_values("left")
+
         tokens = rowdf["text"].astype(str).tolist()
 
-        # Remove the class code token from the front
-        values = []
-        class_seen = False
-
-        for tok in tokens:
-            if not class_seen and normalize_class_code(tok) == class_code:
-                class_seen = True
-                continue
-
-            if class_seen:
-                cleaned = tok.strip()
-                if cleaned:
-                    values.append(cleaned)
-
-        # Expected values:
-        # [proficiency, mid, early, one below, two below, three+ below, no data, total students]
-        if len(values) < 8:
+        # Find proficiency token
+        pct_tokens = [t for t in tokens if "%" in t or re.search(r"\d+\s*[%x]", t)]
+        if not pct_tokens:
             continue
 
-        proficiency = parse_percent(values[0])
-        # After proficiency, the next five numeric columns are:
-        # Mid on grade level, Early on grade level, One below, Two below, Three+ below
-        band_values = []
-        
-        for v in values[1:]:
-            parsed = parse_int(v)
+        proficiency = parse_percent(pct_tokens[0])
+
+        # Get numeric tokens after proficiency
+        pct_index = tokens.index(pct_tokens[0])
+        numeric_after_pct = []
+
+        for tok in tokens[pct_index + 1:]:
+            parsed = parse_int(tok)
             if parsed is not None:
-                band_values.append(parsed)
-        
-        if len(band_values) < 5:
+                numeric_after_pct.append(parsed)
+
+        # Need the five band-count columns:
+        # mid, early, one below, two below, three+ below
+        if len(numeric_after_pct) < 5:
             continue
-        
-        n_size = sum(band_values[:5])
-        
+
+        n_size = sum(numeric_after_pct[:5])
+
         records.append({
             "class_code": str(class_code),
             "proficiency": proficiency,
