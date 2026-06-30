@@ -464,15 +464,7 @@ def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
         ].copy().sort_values("left")
 
         tokens = rowdf["text"].astype(str).tolist()
-        ### Debug test #1
-        if class_code in ["702", "821"]:
-            with st.expander(f"Debug row {class_code}", expanded=True):
-                st.write("Tokens:", tokens)
-                st.dataframe(
-                    rowdf[["text", "left", "top", "xc", "yc"]]
-                    .sort_values("left")
-                    .reset_index(drop=True)
-                )
+       
         # Find proficiency token
         pct_tokens = [t for t in tokens if "%" in t or re.search(r"\d+\s*[%x]", t)]
 
@@ -489,18 +481,34 @@ def extract_table_from_image(pil_img: Image.Image) -> pd.DataFrame:
             parsed = parse_int(tok)
             if parsed is not None:
                 numeric_after_pct.append(parsed)
-        ### Debug test #2
-        if class_code in ["702", "821"]:
-            st.write("Percent token:", pct_tokens)
-            st.write("Numeric after percent:", numeric_after_pct)
-            st.write("Calculated n_size:", sum(numeric_after_pct[:5]))
+        
         
         # Need the five band-count columns:
         # mid, early, one below, two below, three+ below
-        if len(numeric_after_pct) < 5:
-            continue
 
-        n_size = sum(numeric_after_pct[:5])
+        band_sum = sum(numeric_after_pct[:5])
+        if len(numeric_after_pct) >= 7:
+            no_data = numeric_after_pct[-2]
+            total_students = numeric_after_pct[-1]
+
+            # Happy path
+            if band_sum <= total_students:
+                n_size = band_sum
+        
+            else:
+                # Use total - no_data
+                n_size = total_students - no_data
+        
+                # Last resort: common OCR error where 0 -> 6
+                if n_size < 0 or n_size > total_students:
+                    if no_data == 6:
+                        n_size = total_students
+                    else:
+                        # Fall back to the total if we can't reconcile
+                        n_size = total_students
+        
+        else:
+            n_size = band_sum
 
         records.append({
             "class_code": str(class_code),
